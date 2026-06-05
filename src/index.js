@@ -26,6 +26,8 @@ const CORS_BASE_HEADERS = {
   "Access-Control-Max-Age": "86400",
 };
 
+const ALERT_ACTIVE_INDEX_VERSION = 1;
+
 function jsonResponse(payload, status = 200, headers = {}) {
   return new Response(JSON.stringify(payload, null, 2), {
     status,
@@ -1956,6 +1958,10 @@ function getAlertStateKey(rule, fingerprint) {
   return `anycross-alert:${encodeURIComponent(rule.name)}:${fingerprint}`;
 }
 
+function getAlertActiveIndexKey(rule) {
+  return `anycross-alert-index:${encodeURIComponent(rule.name)}`;
+}
+
 async function loadStoredAlertState(env, key) {
   if (!env.ALERT_STATE) {
     return null;
@@ -1977,21 +1983,70 @@ async function saveStoredAlertState(env, key, value, options = {}) {
   await env.ALERT_STATE.put(key, JSON.stringify(value), putOptions);
 }
 
-async function listStoredAlertKeys(env, rule) {
-  if (!env.ALERT_STATE) {
-    return [];
+function createEmptyAlertActiveIndex() {
+  return {
+    version: ALERT_ACTIVE_INDEX_VERSION,
+    active: {},
+  };
+}
+
+function normalizeAlertActiveIndex(rawIndex) {
+  if (!rawIndex || typeof rawIndex !== "object") {
+    return createEmptyAlertActiveIndex();
   }
 
-  const prefix = `anycross-alert:${encodeURIComponent(rule.name)}:`;
-  const names = [];
-  let cursor;
-  do {
-    const page = await env.ALERT_STATE.list({ prefix, cursor });
-    names.push(...page.keys.map((item) => item.name));
-    cursor = page.list_complete ? undefined : page.cursor;
-  } while (cursor);
+  const active = {};
+  const rawActive =
+    rawIndex.active && typeof rawIndex.active === "object" && !Array.isArray(rawIndex.active)
+      ? rawIndex.active
+      : {};
 
-  return names;
+  for (const [key, entry] of Object.entries(rawActive)) {
+    if (!key || !entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const event = entry.event && typeof entry.event === "object" ? entry.event : null;
+    if (!event) {
+      continue;
+    }
+
+    active[key] = {
+      fingerprint: String(entry.fingerprint || event.fingerprint || ""),
+      first_seen_at: Number.isFinite(entry.first_seen_at) ? entry.first_seen_at : undefined,
+      last_sent_at: Number.isFinite(entry.last_sent_at) ? entry.last_sent_at : undefined,
+      event,
+    };
+  }
+
+  return {
+    version: ALERT_ACTIVE_INDEX_VERSION,
+    active,
+  };
+}
+
+async function loadStoredAlertActiveIndex(env, rule) {
+  if (!env.ALERT_STATE) {
+    return createEmptyAlertActiveIndex();
+  }
+
+  const rawIndex = await env.ALERT_STATE.get(getAlertActiveIndexKey(rule), "json");
+  return normalizeAlertActiveIndex(rawIndex);
+}
+
+async function saveStoredAlertActiveIndex(env, rule, index, now) {
+  if (!env.ALERT_STATE) {
+    return;
+  }
+
+  await env.ALERT_STATE.put(
+    getAlertActiveIndexKey(rule),
+    JSON.stringify({
+      version: ALERT_ACTIVE_INDEX_VERSION,
+      updated_at: now,
+      active: index.active,
+    }),
+  );
 }
 
 async function processRuleNotifications(rule, events, env) {
@@ -2000,6 +2055,12 @@ async function processRuleNotifications(rule, events, env) {
     events.map((event) => [getAlertStateKey(rule, event.fingerprint), event]),
   );
   const delivered = [];
+  const previousIndex = env.ALERT_STATE
+    ? await loadStoredAlertActiveIndex(env, rule)
+    : createEmptyAlertActiveIndex();
+  const previousActive = previousIndex.active;
+  const nextIndex = createEmptyAlertActiveIndex();
+  let indexChanged = false;
 
   for (const [key, event] of activeByKey.entries()) {
     const previous = await loadStoredAlertState(env, key);
@@ -2011,6 +2072,18 @@ async function processRuleNotifications(rule, events, env) {
       now - (previous.last_sent_at || 0) >= cooldownMs;
 
     if (!shouldSend) {
+      const previousEntry = previousActive[key];
+      nextIndex.active[key] =
+        previousEntry ||
+        {
+          fingerprint: event.fingerprint,
+          first_seen_at: now,
+          last_sent_at: previous?.last_sent_at,
+          event,
+        };
+      if (!previousEntry) {
+        indexChanged = true;
+      }
       continue;
     }
 
@@ -2025,28 +2098,41 @@ async function processRuleNotifications(rule, events, env) {
       last_sent_at: now,
       event,
     });
+
+    nextIndex.active[key] = {
+      fingerprint: event.fingerprint,
+      first_seen_at: previousActive[key]?.first_seen_at || now,
+      last_sent_at: now,
+      event,
+    };
+    indexChanged = true;
   }
 
-  if (!env.ALERT_STATE || !rule.notify_resolved) {
-    return delivered;
-  }
-
-  const storedKeys = await listStoredAlertKeys(env, rule);
-  for (const key of storedKeys) {
+  for (const [key, previousEntry] of Object.entries(previousActive)) {
     if (activeByKey.has(key)) {
       continue;
     }
 
+    indexChanged = true;
+    if (!env.ALERT_STATE || !rule.notify_resolved || !previousEntry.event) {
+      continue;
+    }
+
     const previous = await loadStoredAlertState(env, key);
-    if (!previous || previous.status !== "firing" || !previous.event) {
+    if (!previous || previous.status !== "firing") {
+      continue;
+    }
+
+    const firingEvent = previous.event || previousEntry.event;
+    if (!firingEvent) {
       continue;
     }
 
     const resolvedEvent = {
-      ...previous.event,
-      title: `${previous.event.title} (已恢复)`,
-      summary: `${previous.event.summary} 已恢复`,
-      detail: `${previous.event.detail}\n恢复时间: ${new Date(now).toISOString()}`,
+      ...firingEvent,
+      title: `${firingEvent.title} (已恢复)`,
+      summary: `${firingEvent.summary} 已恢复`,
+      detail: `${firingEvent.detail}\n恢复时间: ${new Date(now).toISOString()}`,
     };
 
     await sendFeishuTextMessage(rule, "resolved", resolvedEvent);
@@ -2064,10 +2150,14 @@ async function processRuleNotifications(rule, events, env) {
       {
         status: "resolved",
         last_sent_at: now,
-        event: previous.event,
+        event: firingEvent,
       },
       { expirationTtl: resolvedTtl },
     );
+  }
+
+  if (env.ALERT_STATE && indexChanged) {
+    await saveStoredAlertActiveIndex(env, rule, nextIndex, now);
   }
 
   return delivered;
